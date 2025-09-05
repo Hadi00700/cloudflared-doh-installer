@@ -15,9 +15,9 @@ ARCH="$(uname -m)"
 if [ "$ARCH" = "x86_64" ]; then FILE="cloudflared-linux-amd64"
 elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then FILE="cloudflared-linux-arm64"
 else echo "Unsupported architecture: $ARCH"; exit 1; fi
-
 curl -L -o "$BIN" "https://github.com/cloudflare/cloudflared/releases/latest/download/$FILE"
 chmod +x "$BIN"
+chown root:root "$BIN"
 
 echo "[*] Creating service user..."
 id -u cloudflared >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin cloudflared
@@ -57,9 +57,45 @@ echo "[*] Starting cloudflared-doh..."
 systemctl daemon-reload
 systemctl enable --now cloudflared-doh
 
-echo "[*] Testing..."
-ss -lpnut | grep ':53'
-dig @127.0.0.1 google.com +short
-dig @127.0.0.1 AAAA cloudflare.com +short
+echo "[*] Waiting for service to be up..."
+for i in {1..20}; do
+  if systemctl is-active --quiet cloudflared-doh; then
+    break
+  fi
+  sleep 0.5
+done
 
-echo "[✓] Cloudflare DoH installed and active!"
+echo "[*] Testing (with retry)..."
+for i in {1..20}; do
+  if ss -lpnut | grep -q ':53'; then
+    echo "[+] Port 53 is listening"
+    break
+  fi
+  sleep 0.5
+done
+ss -lpnut | grep ':53' || echo "[!] Port 53 not found yet (continuing)"
+
+IPv4_OK=""
+IPv6_OK=""
+for i in {1..5}; do
+  A=$(dig @127.0.0.1 google.com +short | head -n1 || true)
+  AAAA=$(dig @127.0.0.1 AAAA cloudflare.com +short | head -n1 || true)
+  if [ -n "$A" ]; then IPv4_OK="$A"; fi
+  if [ -n "$AAAA" ]; then IPv6_OK="$AAAA"; fi
+  [ -n "$IPv4_OK" ] && break
+  sleep 1
+done
+
+if [ -n "$IPv4_OK" ]; then
+  echo "[+] IPv4 OK: $IPv4_OK"
+else
+  echo "[!] IPv4 test did not return an IP yet"; exit 1
+fi
+
+if [ -n "$IPv6_OK" ]; then
+  echo "[+] IPv6 OK: $IPv6_OK"
+else
+  echo "[!] IPv6 AAAA not returned (may be fine if no IPv6 route)"
+fi
+
+echo "[✓] Cloudflare DoH installed/updated and active!"
