@@ -1,34 +1,36 @@
 #!/usr/bin/env bash
 # Cloudflared DoH Installer/Updater (Ubuntu 24.04)
+# Features:
+#  - Safe binary swap (no "Text file busy")
+#  - Robust service wait & testing (IPv4/IPv6)
+#  - Precise port checks (no false positives)
+#  - Optional --uninstall to restore system defaults
 set -euo pipefail
-
-echo "[*] Installing prerequisites..."
-apt update
-apt install -y curl dnsutils || true
 
 BIN="/usr/local/bin/cloudflared"
 UNIT="/etc/systemd/system/cloudflared-doh.service"
 RESOLV="/etc/resolv.conf"
 
-echo "[*] Detecting arch & preparing download..."
-ARCH="$(uname -m)"
-if [ "$ARCH" = "x86_64" ]; then FILE="cloudflared-linux-amd64"
-elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then FILE="cloudflared-linux-arm64"
-else echo "Unsupported architecture: $ARCH"; exit 1; fi
-URL="https://github.com/cloudflare/cloudflared/releases/latest/download/${FILE}"
+log() { printf "%s\n" "$*"; }
+die() { printf "[-] %s\n" "$*" >&2; exit 1; }
 
-echo "[*] Downloading cloudflared to temp (safe for upgrades)..."
-TMP="${BIN}.new"
-rm -f "$TMP"
-curl -L --fail -o "$TMP" "$URL"
-chmod +x "$TMP"
-chown root:root "$TMP"
+ensure_root() {
+  [ "$(id -u)" -eq 0 ] || die "Please run as root."
+}
 
-echo "[*] Creating service user/group (if missing)..."
-id -u cloudflared >/dev/null 2>&1 || useradd --system --user-group --no-create-home --shell /usr/sbin/nologin cloudflared
+detect_arch() {
+  local arch
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64) FILE="cloudflared-linux-amd64" ;;
+    aarch64|arm64) FILE="cloudflared-linux-arm64" ;;
+    *) die "Unsupported architecture: $arch" ;;
+  esac
+  URL="https://github.com/cloudflare/cloudflared/releases/latest/download/${FILE}"
+}
 
-echo "[*] Writing/refreshing systemd unit..."
-cat > "$UNIT" <<'EOF'
+write_unit() {
+  cat > "$UNIT" <<'EOF'
 [Unit]
 Description=Cloudflared DNS over HTTPS
 After=network-online.target
@@ -52,57 +54,146 @@ RestartSec=2
 [Install]
 WantedBy=multi-user.target
 EOF
+}
 
-echo "[*] Freeing port 53 and pointing resolv.conf to 127.0.0.1..."
-systemctl disable --now systemd-resolved 2>/dev/null || true
-rm -f "$RESOLV"
-printf 'nameserver 127.0.0.1\noptions edns0\n' > "$RESOLV"
+stop_conflicting_services() {
+  # Free port 53 if any other DNS service is listening.
+  systemctl disable --now systemd-resolved 2>/dev/null || true
+  systemctl disable --now dnsmasq 2>/dev/null || true
+  systemctl disable --now unbound 2>/dev/null || true
+  systemctl disable --now bind9 2>/dev/null || true
+}
 
-echo "[*] Swapping binary atomically..."
-systemctl stop cloudflared-doh 2>/dev/null || true
-mv -f "$TMP" "$BIN"
+point_resolv_to_local() {
+  rm -f "$RESOLV"
+  printf 'nameserver 127.0.0.1\noptions edns0\n' > "$RESOLV"
+}
 
-echo "[*] Starting cloudflared-doh..."
-systemctl daemon-reload
-systemctl enable --now cloudflared-doh
+precise_port_check() {
+  # Return 0 only if 127.0.0.1:53 is actually listening (UDP or TCP)
+  ss -lpnut '( sport = :53 )' | grep -qE '\b127\.0\.0\.1:53\b'
+}
 
-echo "[*] Waiting for service to be up..."
-for i in {1..20}; do
-  if systemctl is-active --quiet cloudflared-doh; then break; fi
-  sleep 0.5
-done
+wait_for_service() {
+  # Wait until systemd marks service active
+  for _ in {1..20}; do
+    if systemctl is-active --quiet cloudflared-doh; then return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
 
-echo "[*] Testing (with retry)..."
-for i in {1..20}; do
-  if ss -lpnut | grep -q ':53'; then
-    echo "[+] Port 53 is listening"
-    break
+wait_for_port_53() {
+  for _ in {1..20}; do
+    if precise_port_check; then
+      log "[+] Port 53 is listening on 127.0.0.1"
+      return 0
+    fi
+    sleep 0.5
+  done
+  log "[!] Port 53 not listening yet (continuing)"
+  return 1
+}
+
+test_dns() {
+  local v4 v6
+  v4="$(dig @127.0.0.1 google.com +short | head -n1 || true)"
+  v6="$(dig @127.0.0.1 AAAA cloudflare.com +short | head -n1 || true)"
+
+  # Retry a few times for slow starts
+  for _ in {1..4}; do
+    [ -n "$v4" ] && break
+    sleep 1
+    v4="$(dig @127.0.0.1 google.com +short | head -n1 || true)"
+  done
+
+  if [ -n "$v4" ]; then
+    log "[+] IPv4 OK: $v4"
+  else
+    die "IPv4 test did not return an IP. Check logs: journalctl -u cloudflared-doh -e --no-pager"
   fi
-  sleep 0.5
-done
-ss -lpnut | grep ':53' || echo "[!] Port 53 not found yet (continuing)"
 
-IPv4_OK=""
-IPv6_OK=""
-for i in {1..5}; do
-  A=$(dig @127.0.0.1 google.com +short | head -n1 || true)
-  AAAA=$(dig @127.0.0.1 AAAA cloudflare.com +short | head -n1 || true)
-  [ -n "$A" ] && IPv4_OK="$A"
-  [ -n "$AAAA" ] && IPv6_OK="$AAAA"
-  [ -n "$IPv4_OK" ] && break
-  sleep 1
-done
+  if [ -n "$v6" ]; then
+    log "[+] IPv6 OK: $v6"
+  else
+    log "[!] IPv6 AAAA not returned (may be fine if host lacks IPv6 route)"
+  fi
+}
 
-if [ -n "$IPv4_OK" ]; then
-  echo "[+] IPv4 OK: $IPv4_OK"
-else
-  echo "[!] IPv4 test did not return an IP yet"; exit 1
-fi
+install_or_update() {
+  log "[*] Installing prerequisites..."
+  apt update
+  apt install -y curl dnsutils || true
 
-if [ -n "$IPv6_OK" ]; then
-  echo "[+] IPv6 OK: $IPv6_OK"
-else
-  echo "[!] IPv6 AAAA not returned (may be fine if no IPv6 route)"
-fi
+  detect_arch
 
-echo "[✓] Cloudflare DoH installed/updated and active!"
+  log "[*] Downloading cloudflared to temp (safe for upgrades)..."
+  local tmp="${BIN}.new"
+  rm -f "$tmp"
+  curl -L --fail -o "$tmp" "$URL"
+  chmod +x "$tmp"
+  chown root:root "$tmp"
+
+  log "[*] Creating service user/group (if missing)..."
+  id -u cloudflared >/dev/null 2>&1 || useradd --system --user-group --no-create-home --shell /usr/sbin/nologin cloudflared
+
+  log "[*] Writing/refreshing systemd unit..."
+  write_unit
+
+  log "[*] Freeing port 53 and pointing resolv.conf to 127.0.0.1..."
+  stop_conflicting_services
+  point_resolv_to_local
+
+  log "[*] Swapping binary atomically..."
+  systemctl stop cloudflared-doh 2>/dev/null || true
+  mv -f "$tmp" "$BIN"
+
+  log "[*] Starting cloudflared-doh..."
+  systemctl daemon-reload
+  systemctl enable --now cloudflared-doh
+
+  log "[*] Waiting for service to be up..."
+  wait_for_service || die "Service failed to reach active state."
+
+  log "[*] Testing (with precise port & retry)..."
+  wait_for_port_53 || true
+  # Print precise listeners (for visibility)
+  ss -lpnut '( sport = :53 )' || true
+
+  test_dns
+  log "[✓] Cloudflare DoH installed/updated and active!"
+}
+
+uninstall_and_restore() {
+  log "[*] Uninstalling cloudflared and restoring Ubuntu defaults..."
+
+  systemctl disable --now cloudflared-doh 2>/dev/null || true
+  rm -f "$UNIT"
+  systemctl daemon-reload
+
+  rm -f "$BIN"
+
+  # Remove service user and group (ignore errors if in use)
+  userdel cloudflared 2>/dev/null || true
+  groupdel cloudflared 2>/dev/null || true
+
+  # Restore systemd-resolved default
+  systemctl enable --now systemd-resolved 2>/dev/null || true
+  rm -f "$RESOLV"
+  ln -s /run/systemd/resolve/stub-resolv.conf "$RESOLV" 2>/dev/null || true
+  systemctl restart systemd-resolved 2>/dev/null || true
+
+  log "[✓] Uninstall complete. DNS restored to systemd-resolved defaults."
+  log "    Verify: resolvectl status"
+}
+
+main() {
+  ensure_root
+  if [ "${1-}" = "--uninstall" ]; then
+    uninstall_and_restore
+  else
+    install_or_update
+  fi
+}
+
+main "$@"
