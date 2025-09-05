@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cloudflared DoH Installer (Ubuntu 24.04)
+# Cloudflared DoH Installer/Updater (Ubuntu 24.04)
 set -euo pipefail
 
 echo "[*] Installing prerequisites..."
@@ -10,19 +10,24 @@ BIN="/usr/local/bin/cloudflared"
 UNIT="/etc/systemd/system/cloudflared-doh.service"
 RESOLV="/etc/resolv.conf"
 
-echo "[*] Downloading cloudflared..."
+echo "[*] Detecting arch & preparing download..."
 ARCH="$(uname -m)"
 if [ "$ARCH" = "x86_64" ]; then FILE="cloudflared-linux-amd64"
 elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then FILE="cloudflared-linux-arm64"
 else echo "Unsupported architecture: $ARCH"; exit 1; fi
-curl -L -o "$BIN" "https://github.com/cloudflare/cloudflared/releases/latest/download/$FILE"
-chmod +x "$BIN"
-chown root:root "$BIN"
+URL="https://github.com/cloudflare/cloudflared/releases/latest/download/${FILE}"
 
-echo "[*] Creating service user..."
-id -u cloudflared >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin cloudflared
+echo "[*] Downloading cloudflared to temp (safe for upgrades)..."
+TMP="${BIN}.new"
+rm -f "$TMP"
+curl -L --fail -o "$TMP" "$URL"
+chmod +x "$TMP"
+chown root:root "$TMP"
 
-echo "[*] Writing systemd unit..."
+echo "[*] Creating service user/group (if missing)..."
+id -u cloudflared >/dev/null 2>&1 || useradd --system --user-group --no-create-home --shell /usr/sbin/nologin cloudflared
+
+echo "[*] Writing/refreshing systemd unit..."
 cat > "$UNIT" <<'EOF'
 [Unit]
 Description=Cloudflared DNS over HTTPS
@@ -48,10 +53,14 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
-echo "[*] Freeing port 53..."
+echo "[*] Freeing port 53 and pointing resolv.conf to 127.0.0.1..."
 systemctl disable --now systemd-resolved 2>/dev/null || true
 rm -f "$RESOLV"
 printf 'nameserver 127.0.0.1\noptions edns0\n' > "$RESOLV"
+
+echo "[*] Swapping binary atomically..."
+systemctl stop cloudflared-doh 2>/dev/null || true
+mv -f "$TMP" "$BIN"
 
 echo "[*] Starting cloudflared-doh..."
 systemctl daemon-reload
@@ -59,9 +68,7 @@ systemctl enable --now cloudflared-doh
 
 echo "[*] Waiting for service to be up..."
 for i in {1..20}; do
-  if systemctl is-active --quiet cloudflared-doh; then
-    break
-  fi
+  if systemctl is-active --quiet cloudflared-doh; then break; fi
   sleep 0.5
 done
 
@@ -80,8 +87,8 @@ IPv6_OK=""
 for i in {1..5}; do
   A=$(dig @127.0.0.1 google.com +short | head -n1 || true)
   AAAA=$(dig @127.0.0.1 AAAA cloudflare.com +short | head -n1 || true)
-  if [ -n "$A" ]; then IPv4_OK="$A"; fi
-  if [ -n "$AAAA" ]; then IPv6_OK="$AAAA"; fi
+  [ -n "$A" ] && IPv4_OK="$A"
+  [ -n "$AAAA" ] && IPv6_OK="$AAAA"
   [ -n "$IPv4_OK" ] && break
   sleep 1
 done
